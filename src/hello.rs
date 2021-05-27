@@ -1,6 +1,6 @@
-extern crate winit;
+#![allow(unused)]
 
-use log::{debug, error, log_enabled, info, Level};
+use log::{debug, error, info, log_enabled, Level};
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -10,20 +10,30 @@ use winit::event::{Event, WindowEvent};
 use winit::event_loop::{ControlFlow, EventLoop};
 use winit::window::{Window, WindowBuilder};
 
+use vulkano::descriptor::PipelineLayoutAbstract;
 use vulkano::device::{Device, DeviceExtensions, Features, Queue};
 use vulkano::format::Format;
+use vulkano::framebuffer::{RenderPassAbstract, Subpass, FramebufferAbstract, Framebuffer};
 use vulkano::image::{swapchain::SwapchainImage, ImageUsage};
 use vulkano::instance::debug::{DebugCallback, MessageSeverity, MessageType};
 use vulkano::instance::{
     layers_list, ApplicationInfo, Instance, InstanceExtensions, PhysicalDevice, Version,
 };
+use vulkano::pipeline::{vertex::BufferlessDefinition, viewport::Viewport, GraphicsPipeline};
+use vulkano::single_pass_renderpass;
 use vulkano::swapchain::{
-    Capabilities, ColorSpace, CompositeAlpha, PresentMode, SupportedPresentModes, Surface,
-    Swapchain, FullscreenExclusive,
+    Capabilities, ColorSpace, CompositeAlpha, FullscreenExclusive, PresentMode,
+    SupportedPresentModes, Surface, Swapchain,
 };
 use vulkano::sync::SharingMode;
 
 use vulkano_win::VkSurfaceBuild;
+
+type ConcreteGraphicsPipeline = GraphicsPipeline<
+    BufferlessDefinition,
+    Box<dyn PipelineLayoutAbstract + Send + Sync + 'static>,
+    Arc<dyn RenderPassAbstract + Send + Sync + 'static>,
+>;
 
 const WIDTH: u32 = 800;
 const HEIGHT: u32 = 600;
@@ -76,6 +86,12 @@ pub struct HelloWorldApplication {
 
     swap_chain: Arc<Swapchain<Window>>,
     swap_chain_images: Vec<Arc<SwapchainImage<Window>>>,
+
+    render_pass: Arc<dyn RenderPassAbstract + Send + Sync>,
+
+    graphics_pipeline: Arc<ConcreteGraphicsPipeline>,
+
+    swap_chain_framebuffers: Vec<Arc<dyn FramebufferAbstract + Send + Sync>>,
 }
 
 impl HelloWorldApplication {
@@ -96,6 +112,12 @@ impl HelloWorldApplication {
             &present_queue,
         );
 
+        let render_pass = Self::create_render_pass(&device, swap_chain.format());
+
+        let graphics_pipeline = Self::create_graphics_pipeline(&device, swap_chain.dimensions(), &render_pass);
+
+        let swap_chain_framebuffers = Self::create_framebuffers(&swap_chain_images, &render_pass);
+
         Self {
             event_loop,
             surface,
@@ -109,6 +131,12 @@ impl HelloWorldApplication {
 
             swap_chain,
             swap_chain_images,
+
+            render_pass,
+
+            graphics_pipeline,
+
+            swap_chain_framebuffers,
         }
     }
 
@@ -302,6 +330,93 @@ impl HelloWorldApplication {
         .expect("Failed to create swap chain");
 
         (swap_chain, images)
+    }
+
+    fn create_render_pass(
+        device: &Arc<Device>,
+        color_format: Format,
+    ) -> Arc<dyn RenderPassAbstract + Send + Sync> {
+        Arc::new(
+            single_pass_renderpass!(device.clone(),
+            attachments: {
+                color: {
+                    load: Clear,
+                    store: Store,
+                    format: color_format,
+                    samples: 1,
+                }
+            },
+            pass: {
+                color: [color],
+                depth_stencil: {}
+            })
+            .unwrap(),
+        )
+    }
+
+    fn create_graphics_pipeline(
+        device: &Arc<Device>,
+        swap_chain_extent: [u32; 2],
+        render_pass: &Arc<dyn RenderPassAbstract + Send + Sync>,
+    ) -> Arc<ConcreteGraphicsPipeline> {
+        mod vertex_shader {
+            vulkano_shaders::shader! {
+                ty: "vertex",
+                path: "src/bin/shader_base.vert"
+            }
+        }
+
+        mod fragment_shader {
+            vulkano_shaders::shader! {
+                ty: "fragment",
+                path: "src/bin/shader_base.frag"
+            }
+        }
+
+        let vert_shader_module = vertex_shader::Shader::load(device.clone())
+            .expect("failed to create vertex shader module");
+        let frag_shader_module = fragment_shader::Shader::load(device.clone())
+            .expect("failed to create fragment shader module");
+
+        let dimensions = [swap_chain_extent[0] as f32, swap_chain_extent[1] as f32];
+
+        let viewport = Viewport {
+            origin: [0.0, 0.0],
+            dimensions,
+            depth_range: 0.0..1.0,
+        };
+
+        Arc::new(
+            GraphicsPipeline::start()
+                .vertex_input(BufferlessDefinition {})
+                .vertex_shader(vert_shader_module.main_entry_point(), ())
+                .triangle_list()
+                .primitive_restart(false)
+                .viewports(vec![viewport]) // NOTE: Also sets scissor to cover whole viewport
+                .fragment_shader(frag_shader_module.main_entry_point(), ())
+                .depth_clamp(false)
+                .polygon_mode_fill()
+                .line_width(1.0)
+                .cull_mode_back()
+                .front_face_clockwise()
+                .blend_pass_through()
+                .render_pass(Subpass::from(render_pass.clone(), 0).unwrap())
+                .build(device.clone())
+                .unwrap(),
+        )
+    }
+
+    fn create_framebuffers(
+        swap_chain_images: &[Arc<SwapchainImage<Window>>],
+        render_pass: &Arc<dyn RenderPassAbstract + Send + Sync>
+    ) -> Vec<Arc<dyn FramebufferAbstract + Send + Sync>> {
+        swap_chain_images.iter()
+            .map(|image| {
+                let fba: Arc<dyn FramebufferAbstract + Send + Sync> = Arc::new(Framebuffer::start(render_pass.clone()))
+                    .add(image.clone()).unwrap()
+                    .build().unwrap();
+                fba
+            }).collect::<Vec<_>>()
     }
 
     fn find_queue_families(

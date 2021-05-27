@@ -1,6 +1,6 @@
 mod hello;
 
-use log::{debug, error, log_enabled, info, Level};
+use log::{debug, error, info, log_enabled, Level};
 
 fn main() {
     env_logger::init();
