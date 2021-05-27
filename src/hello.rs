@@ -1,5 +1,7 @@
 extern crate winit;
 
+use log::{debug, error, log_enabled, info, Level};
+
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -9,21 +11,16 @@ use winit::event_loop::{ControlFlow, EventLoop};
 use winit::window::{Window, WindowBuilder};
 
 use vulkano::device::{Device, DeviceExtensions, Features, Queue};
+use vulkano::format::Format;
+use vulkano::image::{swapchain::SwapchainImage, ImageUsage};
 use vulkano::instance::debug::{DebugCallback, MessageSeverity, MessageType};
 use vulkano::instance::{
     layers_list, ApplicationInfo, Instance, InstanceExtensions, PhysicalDevice, Version,
 };
 use vulkano::swapchain::{
-    Surface,
-    Capabilities,
-    ColorSpace,
-    SupportedPresentModes,
-    PresentMode,
-    Swapchain,
-    CompositeAlpha,
+    Capabilities, ColorSpace, CompositeAlpha, PresentMode, SupportedPresentModes, Surface,
+    Swapchain, FullscreenExclusive,
 };
-use vulkano::format::Format;
-use vulkano::image::{ImageUsage, swapchain::SwapchainImage};
 use vulkano::sync::SharingMode;
 
 use vulkano_win::VkSurfaceBuild;
@@ -36,7 +33,7 @@ const VALIDATION_LAYERS: &[&str] = &["VK_LAYER_KHRONOS_validation"];
 fn device_extensions() -> DeviceExtensions {
     DeviceExtensions {
         khr_swapchain: true,
-        .. DeviceExtensions::none()
+        ..DeviceExtensions::none()
     }
 }
 
@@ -90,8 +87,14 @@ impl HelloWorldApplication {
         let (device, graphics_queue, present_queue) =
             Self::create_logical_device(&instance, &surface, physical_device_index);
 
-        let (swap_chain, swap_chain_images) = Self::create_swap_chain(&instance, &surface, physical_device_index, &device,
-            &graphics_queue, &present_queue);
+        let (swap_chain, swap_chain_images) = Self::create_swap_chain(
+            &instance,
+            &surface,
+            physical_device_index,
+            &device,
+            &graphics_queue,
+            &present_queue,
+        );
 
         Self {
             event_loop,
@@ -111,12 +114,12 @@ impl HelloWorldApplication {
 
     fn create_instance() -> Arc<Instance> {
         if ENABLE_VALIDATION_LAYERS && !Self::check_validation_layers_support() {
-            println!("Validation layers requested, but not available!");
+            error!("Validation layers requested, but not available!");
         }
 
         let supported_extensions = InstanceExtensions::supported_by_core()
             .expect("Failed to retrieve supported extensions");
-        println!("Supported extensions: {:?}", supported_extensions);
+        info!("Supported extensions: {:?}", supported_extensions);
         let app_info = ApplicationInfo {
             application_name: Some("Vulkan Renderer".into()),
             application_version: Some(Version {
@@ -152,7 +155,7 @@ impl HelloWorldApplication {
         };
 
         DebugCallback::new(&instance, msg_severity, msg_types, |msg| {
-            println!("Validation layer: {:?}", msg.description);
+            info!("Validation layer: {:?}", msg.description);
         })
         .ok()
     }
@@ -188,12 +191,12 @@ impl HelloWorldApplication {
         let indices = Self::find_queue_families(surface, device);
         let extensions_supported = Self::check_device_extension_support(device);
         let swap_chain_adequate = if extensions_supported {
-            let capabilities = surface.capabilities(*device)
+            let capabilities = surface
+                .capabilities(*device)
                 .expect("Failed to get surface capabilities");
-            !capabilities.supported_formats.is_empty() &&
-                capabilities.present_modes.iter().next().is_some()
-        }
-        else {
+            !capabilities.supported_formats.is_empty()
+                && capabilities.present_modes.iter().next().is_some()
+        } else {
             false
         };
 
@@ -207,8 +210,40 @@ impl HelloWorldApplication {
         available_extensions.intersection(&device_extensions) == device_extensions
     }
 
-    fn choose_swap_surface_format(available_formats: &[(Format, ColorSpace)]) -> (Format, ColorSpace) {
+    fn choose_swap_surface_format(
+        available_formats: &[(Format, ColorSpace)],
+    ) -> (Format, ColorSpace) {
+        *available_formats
+            .iter()
+            .find(|(format, color_space)| {
+                *format == Format::B8G8R8A8Unorm && *color_space == ColorSpace::SrgbNonLinear
+            })
+            .unwrap_or_else(|| &available_formats[0])
+    }
 
+    fn choose_swap_present_mode(available_present_modes: SupportedPresentModes) -> PresentMode {
+        if available_present_modes.mailbox {
+            PresentMode::Mailbox
+        } else if available_present_modes.immediate {
+            PresentMode::Immediate
+        } else {
+            PresentMode::Fifo
+        }
+    }
+
+    fn choose_swap_extent(capabilities: &Capabilities) -> [u32; 2] {
+        if let Some(current_extent) = capabilities.current_extent {
+            current_extent
+        } else {
+            let mut actual_extent = [WIDTH, HEIGHT];
+
+            actual_extent[0] =
+                actual_extent[0].clamp(actual_extent[0], capabilities.max_image_extent[0]);
+            actual_extent[1] =
+                actual_extent[1].clamp(actual_extent[1], capabilities.max_image_extent[1]);
+
+            actual_extent
+        }
     }
 
     fn create_swap_chain(
@@ -220,21 +255,24 @@ impl HelloWorldApplication {
         present_queue: &Arc<Queue>,
     ) -> (Arc<Swapchain<Window>>, Vec<Arc<SwapchainImage<Window>>>) {
         let physical_device = PhysicalDevice::from_index(instance, physical_devince_index).unwrap();
-        let capabilities = surface.capabilities(physical_device)
+        let capabilities = surface
+            .capabilities(physical_device)
             .expect("failed to get surface capabilities");
 
         let surface_format = Self::choose_swap_surface_format(&capabilities.supported_formats);
         let present_mode = Self::choose_swap_present_mode(capabilities.present_modes);
-        let extent = Self::chose_swap_extent(&capabilities);
+        let extent = Self::choose_swap_extent(&capabilities);
 
         let mut image_count = capabilities.min_image_count + 1;
-        if capabilities.max_image_count.is_some() && image_count > capabilities.max_image_count.unwrap() {
+        if capabilities.max_image_count.is_some()
+            && image_count > capabilities.max_image_count.unwrap()
+        {
             image_count = capabilities.max_image_count.unwrap();
         }
 
         let image_usage = ImageUsage {
             color_attachment: true,
-            .. ImageUsage::none()
+            ..ImageUsage::none()
         };
 
         let indices = Self::find_queue_families(&surface, &physical_device);
@@ -243,10 +281,33 @@ impl HelloWorldApplication {
             vec![graphics_queue, present_queue].as_slice().into()
         } else {
             graphics_queue.into()
-        }
+        };
+
+        let (swap_chain, images) = Swapchain::new(
+            device.clone(),
+            surface.clone(),
+            image_count,
+            surface_format.0,
+            extent,
+            1,
+            image_usage,
+            sharing,
+            capabilities.current_transform,
+            CompositeAlpha::Opaque,
+            present_mode,
+            FullscreenExclusive::Default,
+            true,
+            surface_format.1,
+        )
+        .expect("Failed to create swap chain");
+
+        (swap_chain, images)
     }
 
-    fn find_queue_families(surface: &Arc<Surface<Window>>, device: &PhysicalDevice) -> QueueFamilyIndices {
+    fn find_queue_families(
+        surface: &Arc<Surface<Window>>,
+        device: &PhysicalDevice,
+    ) -> QueueFamilyIndices {
         let mut indices = QueueFamilyIndices::new();
 
         for (i, queue_family) in device.queue_families().enumerate() {
@@ -282,7 +343,10 @@ impl HelloWorldApplication {
         let queue_priority = 1.0;
 
         let queue_families = unique_queue_families.iter().map(|i| {
-            (physical_device.queue_families().nth(**i as usize).unwrap(), queue_priority)
+            (
+                physical_device.queue_families().nth(**i as usize).unwrap(),
+                queue_priority,
+            )
         });
 
         // NOTE: the tutorial recommends passing the validation layers as well
@@ -292,8 +356,8 @@ impl HelloWorldApplication {
         let (device, mut queues) = Device::new(
             physical_device,
             &Features::none(),
-            &DeviceExtensions::none(),
-            queue_families
+            &device_extensions(),
+            queue_families,
         )
         .expect("Failed to create logical device!");
 
