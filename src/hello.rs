@@ -11,31 +11,35 @@ use winit::event::{Event, WindowEvent};
 use winit::event_loop::{ControlFlow, EventLoop};
 use winit::window::{Window, WindowBuilder};
 
-use vulkano::descriptor::PipelineLayoutAbstract;
+use vulkano::command_buffer::{
+    AutoCommandBufferBuilder, CommandBufferUsage, DynamicState, PrimaryAutoCommandBuffer,
+    SubpassContents,
+};
 use vulkano::device::{Device, DeviceExtensions, Features, Queue};
 use vulkano::format::Format;
-use vulkano::render_pass::{Framebuffer, FramebufferAbstract, RenderPass, Subpass};
 use vulkano::image::{swapchain::SwapchainImage, view::ImageView, ImageUsage};
 use vulkano::instance::debug::{DebugCallback, MessageSeverity, MessageType};
 use vulkano::instance::{
     layers_list, ApplicationInfo, Instance, InstanceExtensions, PhysicalDevice, Version,
 };
-use vulkano::pipeline::{vertex::BufferlessDefinition, viewport::Viewport, GraphicsPipeline, vertex::BufferlessVertices};
+use vulkano::pipeline::{
+    viewport::Viewport, GraphicsPipeline, GraphicsPipelineAbstract
+};
+use vulkano::render_pass::{Framebuffer, FramebufferAbstract, RenderPass, Subpass};
 use vulkano::single_pass_renderpass;
 use vulkano::swapchain::{
-    Capabilities, ColorSpace, CompositeAlpha, FullscreenExclusive, PresentMode,
-    SupportedPresentModes, Surface, Swapchain, acquire_next_image,
+    acquire_next_image, AcquireError, Capabilities, ColorSpace, CompositeAlpha,
+    FullscreenExclusive, PresentMode, SupportedPresentModes, Surface, Swapchain,
 };
-use vulkano::sync::{SharingMode, GpuFuture};
-use vulkano::command_buffer::{PrimaryAutoCommandBuffer, AutoCommandBufferBuilder, DynamicState, SubpassContents, CommandBufferUsage};
+use vulkano::sync::{self, GpuFuture, SharingMode};
+use vulkano::buffer::{
+    cpu_access::CpuAccessibleBuffer,
+    BufferUsage,
+    BufferAccess,
+};
+use vulkano::impl_vertex;
 
 use vulkano_win::VkSurfaceBuild;
-
-//type ConcreteGraphicsPipeline = GraphicsPipeline<
-//    BufferlessDefinition,
-//    Box<dyn PipelineLayoutAbstract + Send + Sync + 'static>,
-//    Arc<RenderPass>,
-//>;
 
 const WIDTH: u32 = 800;
 const HEIGHT: u32 = 600;
@@ -73,11 +77,33 @@ impl QueueFamilyIndices {
     }
 }
 
+#[derive(Default, Copy, Clone)]
+struct Vertex {
+    position: [f32; 2],
+    color: [f32; 3],
+}
+
+impl Vertex {
+    fn new(position: [f32; 2], color: [f32; 3]) -> Self {
+        Self { position, color }
+    }
+}
+impl_vertex!(Vertex, position, color);
+
+fn vertices() -> [Vertex; 3] {
+    [
+        Vertex::new([ 0.0, -0.5], [1.0, 0.0, 0.0]),
+        Vertex::new([ 0.5,  0.5], [0.0, 1.0, 0.0]),
+        Vertex::new([-0.5,  0.5], [0.0, 0.0, 1.0]),
+    ]
+}
+
 pub struct HelloWorldApplication {
     event_loop: Option<EventLoop<()>>,
     surface: Arc<Surface<Window>>,
     instance: Arc<Instance>,
 
+    #[allow(unused)]
     debug_callback: Option<DebugCallback>,
 
     physical_device_index: usize,
@@ -91,11 +117,15 @@ pub struct HelloWorldApplication {
 
     render_pass: Arc<RenderPass>,
 
-    graphics_pipeline: Arc<GraphicsPipeline<BufferlessDefinition, Box<dyn PipelineLayoutAbstract + Send + Sync>>>,
+    graphics_pipeline: Arc<dyn GraphicsPipelineAbstract + Send + Sync>,
 
     swap_chain_framebuffers: Vec<Arc<dyn FramebufferAbstract + Send + Sync>>,
 
-    command_buffers: Vec<Arc<PrimaryAutoCommandBuffer>>,
+    vertex_buffer: Arc<dyn BufferAccess + Send + Sync>,
+    //command_buffers: Vec<Arc<PrimaryAutoCommandBuffer>>,
+
+    previous_frame_end: Option<Box<dyn GpuFuture>>,
+    recreate_swap_chain: bool,
 }
 
 impl HelloWorldApplication {
@@ -114,6 +144,7 @@ impl HelloWorldApplication {
             &device,
             &graphics_queue,
             &present_queue,
+            None,
         );
 
         let render_pass = Self::create_render_pass(&device, swap_chain.format());
@@ -122,6 +153,10 @@ impl HelloWorldApplication {
             Self::create_graphics_pipeline(&device, swap_chain.dimensions(), &render_pass);
 
         let swap_chain_framebuffers = Self::create_framebuffers(&swap_chain_images, &render_pass);
+
+        let vertex_buffer = Self::create_vertex_buffer(&device);
+
+        let previous_frame_end = Some(Self::create_sync_objects(&device));
 
         let mut app = Self {
             event_loop: Some(event_loop),
@@ -143,10 +178,14 @@ impl HelloWorldApplication {
 
             swap_chain_framebuffers,
 
-            command_buffers: vec![],
+            vertex_buffer,
+            //command_buffers: vec![],
+
+            previous_frame_end,
+            recreate_swap_chain: false,
         };
 
-        app.create_command_buffers();
+        //app.create_command_buffers();
         app
     }
 
@@ -178,25 +217,48 @@ impl HelloWorldApplication {
             .expect("Failed to create Vulkan instance")
     }
 
-    fn create_command_buffers(&mut self) {
-        let queue_family = self.graphics_queue.family();
-        self.command_buffers = self.swap_chain_framebuffers.iter()
-            .map(|framebuffer| {
+    //fn create_command_buffers(&mut self) {
+    //    let queue_family = self.graphics_queue.family();
+    //    self.command_buffers = self
+    //        .swap_chain_framebuffers
+    //        .iter()
+    //        .map(|framebuffer| {
+    //            let vertices = BufferlessVertices {
+    //                vertices: 3,
+    //                instances: 1,
+    //            };
+    //            let mut builder = AutoCommandBufferBuilder::primary(
+    //                self.device.clone(),
+    //                queue_family,
+    //                CommandBufferUsage::MultipleSubmit,
+    //            )
+    //            .unwrap();
 
-                let vertices = BufferlessVertices { vertices: 3, instances: 1 };
-                let mut builder = AutoCommandBufferBuilder::primary(self.device.clone(), queue_family, CommandBufferUsage::MultipleSubmit).unwrap();
+    //            builder
+    //                .begin_render_pass(
+    //                    framebuffer.clone(),
+    //                    SubpassContents::Inline,
+    //                    vec![[0.0, 0.0, 0.0, 1.0].into()],
+    //                )
+    //                .unwrap()
+    //                .draw(
+    //                    self.graphics_pipeline.clone(),
+    //                    &DynamicState::none(),
+    //                    vertices,
+    //                    (),
+    //                    (),
+    //                    vec![],
+    //                )
+    //                .unwrap()
+    //                .end_render_pass()
+    //                .unwrap();
 
-                builder
-                    .begin_render_pass(framebuffer.clone(), SubpassContents::Inline, vec![[0.0, 0.0, 0.0, 1.0].into()]).unwrap()
-                    .draw(self.graphics_pipeline.clone(), &DynamicState::none(), vertices, (), (), vec![]).unwrap()
-                    .end_render_pass().unwrap();
+    //            let command_buffer = builder.build().unwrap();
 
-                let command_buffer = builder.build().unwrap();
-
-                Arc::new(command_buffer)
-            })
-            .collect();
-    }
+    //            Arc::new(command_buffer)
+    //        })
+    //        .collect();
+    //}
 
     fn setup_debug_callback(instance: &Arc<Instance>) -> Option<DebugCallback> {
         if !ENABLE_VALIDATION_LAYERS {
@@ -311,6 +373,7 @@ impl HelloWorldApplication {
         device: &Arc<Device>,
         graphics_queue: &Arc<Queue>,
         present_queue: &Arc<Queue>,
+        old_swapchain: Option<Arc<Swapchain<Window>>>,
     ) -> (Arc<Swapchain<Window>>, Vec<Arc<SwapchainImage<Window>>>) {
         let physical_device = PhysicalDevice::from_index(instance, physical_devince_index).unwrap();
         let capabilities = surface
@@ -341,7 +404,13 @@ impl HelloWorldApplication {
             graphics_queue.into()
         };
 
-        let (swap_chain, images) = Swapchain::start(device.clone(), surface.clone())
+        let swapchain_builder = if let Some(old) = old_swapchain {
+            old.recreate()
+        } else {
+            Swapchain::start(device.clone(), surface.clone())
+        };
+
+        swapchain_builder
             .num_images(image_count)
             .format(surface_format.0)
             .dimensions(extent)
@@ -354,15 +423,10 @@ impl HelloWorldApplication {
             .clipped(true)
             .color_space(surface_format.1)
             .build()
-            .expect("Failed to create swap chain");
-
-        (swap_chain, images)
+            .expect("Failed to create swap chain")
     }
 
-    fn create_render_pass(
-        device: &Arc<Device>,
-        color_format: Format,
-    ) -> Arc<RenderPass> {
+    fn create_render_pass(device: &Arc<Device>, color_format: Format) -> Arc<RenderPass> {
         Arc::new(
             single_pass_renderpass!(device.clone(),
             attachments: {
@@ -385,7 +449,8 @@ impl HelloWorldApplication {
         device: &Arc<Device>,
         swap_chain_extent: [u32; 2],
         render_pass: &Arc<RenderPass>,
-    ) -> Arc<GraphicsPipeline<BufferlessDefinition, Box<dyn PipelineLayoutAbstract + Send + Sync>>> {
+    ) -> Arc<dyn GraphicsPipelineAbstract + Send + Sync>
+    {
         mod vertex_shader {
             vulkano_shaders::shader! {
                 ty: "vertex",
@@ -415,7 +480,7 @@ impl HelloWorldApplication {
 
         Arc::new(
             GraphicsPipeline::start()
-                .vertex_input(BufferlessDefinition {})
+                .vertex_input_single_buffer::<Vertex>()
                 .vertex_shader(vert_shader_module.main_entry_point(), ())
                 .triangle_list()
                 .primitive_restart(false)
@@ -429,8 +494,13 @@ impl HelloWorldApplication {
                 .blend_pass_through()
                 .render_pass(Subpass::from(render_pass.clone(), 0).unwrap())
                 .build(device.clone())
-                .unwrap()
+                .unwrap(),
         )
+    }
+
+    fn create_vertex_buffer(device: &Arc<Device>) -> Arc<dyn BufferAccess + Send + Sync> {
+        CpuAccessibleBuffer::from_iter(device.clone(),
+            BufferUsage::vertex_buffer(), false, vertices().iter().cloned()).unwrap()
     }
 
     fn create_framebuffers(
@@ -451,6 +521,10 @@ impl HelloWorldApplication {
                 fba
             })
             .collect::<Vec<_>>()
+    }
+
+    fn create_sync_objects(device: &Arc<Device>) -> Box<dyn GpuFuture> {
+        sync::now(device.clone()).boxed()
     }
 
     fn find_queue_families(
@@ -528,36 +602,130 @@ impl HelloWorldApplication {
         (event_loop, surface)
     }
 
-    fn draw_frame(&self) {
-        let (image_index, is_suboptimal, acquire_future) = acquire_next_image(self.swap_chain.clone(), None).unwrap();
-        let command_buffer = self.command_buffers[image_index].clone();
-        let future = acquire_future
-            .then_execute(self.graphics_queue.clone(), command_buffer)
+    fn draw_frame(&mut self) {
+        self.previous_frame_end.as_mut().unwrap().cleanup_finished();
+
+        if self.recreate_swap_chain {
+            info!("Recreating swapchain");
+            self.recreate_swap_chain();
+            self.recreate_swap_chain = false;
+        }
+
+        let (image_index, is_suboptimal, acquire_future) =
+            match acquire_next_image(self.swap_chain.clone(), None) {
+                Ok(r) => r,
+                Err(AcquireError::OutOfDate) => {
+                    self.recreate_swap_chain = true;
+                    return;
+                }
+                Err(err) => panic!("{:?}", err),
+            };
+
+        if is_suboptimal {
+            self.recreate_swap_chain = true;
+        }
+
+        let mut builder = AutoCommandBufferBuilder::primary(
+            self.device.clone(),
+            self.graphics_queue.family(),
+            CommandBufferUsage::MultipleSubmit,
+        )
+        .unwrap();
+
+        builder
+            .begin_render_pass(
+                self.swap_chain_framebuffers[image_index].clone(),
+                SubpassContents::Inline,
+                vec![[0.0, 0.0, 0.0, 1.0].into()],
+            )
             .unwrap()
-            .then_swapchain_present(self.present_queue.clone(), self.swap_chain.clone(), image_index)
-            .then_signal_fence_and_flush()
+            .draw(
+                self.graphics_pipeline.clone(),
+                &DynamicState::none(),
+                vec![self.vertex_buffer.clone()],
+                (),
+                (),
+                vec![],
+            )
+            .unwrap()
+            .end_render_pass()
             .unwrap();
 
-        future.wait(None).unwrap();
+        let command_buffer = builder.build().unwrap();
+
+        let future = self
+            .previous_frame_end
+            .take()
+            .unwrap()
+            .join(acquire_future)
+            .then_execute(self.graphics_queue.clone(), command_buffer)
+            .unwrap()
+            .then_swapchain_present(
+                self.present_queue.clone(),
+                self.swap_chain.clone(),
+                image_index,
+            )
+            .then_signal_fence_and_flush();
+
+        match future {
+            Ok(future) => {
+                self.previous_frame_end = Some(future.boxed());
+            }
+            Err(vulkano::sync::FlushError::OutOfDate) => {
+                self.recreate_swap_chain = true;
+                self.previous_frame_end =
+                    Some(vulkano::sync::now(self.device.clone()).boxed());
+            }
+            Err(e) => {
+                println!("{:?}", e);
+                self.previous_frame_end =
+                    Some(vulkano::sync::now(self.device.clone()).boxed());
+            }
+        }
+    }
+
+    fn recreate_swap_chain(&mut self) {
+        let (swap_chain, images) = Self::create_swap_chain(
+            &self.instance,
+            &self.surface,
+            self.physical_device_index,
+            &self.device,
+            &self.graphics_queue,
+            &self.present_queue,
+            Some(self.swap_chain.clone()),
+        );
+        self.swap_chain = swap_chain;
+        self.swap_chain_images = images;
+        self.render_pass = Self::create_render_pass(&self.device, self.swap_chain.format());
+        self.graphics_pipeline = Self::create_graphics_pipeline(
+            &self.device,
+            self.swap_chain.dimensions(),
+            &self.render_pass,
+        );
+        self.swap_chain_framebuffers = Self::create_framebuffers(&self.swap_chain_images, &self.render_pass);
+        //self.create_command_buffers();
     }
 
     pub fn main_loop(mut self) {
         let event_loop = &mut self.event_loop;
         let surface_window_id = self.surface.window().id();
 
-        self.event_loop.take().unwrap().run(move |event, _, control_flow| {
-            *control_flow = ControlFlow::Wait;
+        self.event_loop
+            .take()
+            .unwrap()
+            .run(move |event, _, control_flow| {
+                *control_flow = ControlFlow::Wait;
 
-            match event {
-                Event::WindowEvent {
-                    event: WindowEvent::CloseRequested,
-                    window_id,
-                } if window_id == surface_window_id => *control_flow = ControlFlow::Exit,
-                Event::MainEventsCleared => {
-                    self.draw_frame();
-                },
-                _ => (),
-            }
-        });
+                match event {
+                    Event::WindowEvent {
+                        event: WindowEvent::CloseRequested,
+                        window_id,
+                    } if window_id == surface_window_id => *control_flow = ControlFlow::Exit,
+                    Event::RedrawEventsCleared => {
+                        self.draw_frame();
+                    }
+                    _ => (),
+                }
+            });
     }
 }
