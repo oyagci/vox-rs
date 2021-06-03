@@ -5,26 +5,33 @@ use log::{debug, error, info, log_enabled, Level};
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Instant;
 
 use winit::dpi::LogicalSize;
 use winit::event::{Event, WindowEvent};
 use winit::event_loop::{ControlFlow, EventLoop};
 use winit::window::{Window, WindowBuilder};
 
+use vulkano::buffer::{
+    BufferAccess, BufferUsage, CpuAccessibleBuffer, ImmutableBuffer, TypedBufferAccess,
+};
 use vulkano::command_buffer::{
     AutoCommandBufferBuilder, CommandBufferUsage, DynamicState, PrimaryAutoCommandBuffer,
     SubpassContents,
 };
+use vulkano::descriptor::descriptor::{
+    DescriptorBufferDesc, DescriptorDesc, DescriptorDescTy, ShaderStages,
+};
+use vulkano::descriptor::descriptor_set::{PersistentDescriptorSet, UnsafeDescriptorSetLayout};
 use vulkano::device::{Device, DeviceExtensions, Features, Queue};
 use vulkano::format::Format;
 use vulkano::image::{swapchain::SwapchainImage, view::ImageView, ImageUsage};
+use vulkano::impl_vertex;
 use vulkano::instance::debug::{DebugCallback, MessageSeverity, MessageType};
 use vulkano::instance::{
     layers_list, ApplicationInfo, Instance, InstanceExtensions, PhysicalDevice, Version,
 };
-use vulkano::pipeline::{
-    viewport::Viewport, GraphicsPipeline, GraphicsPipelineAbstract
-};
+use vulkano::pipeline::{viewport::Viewport, GraphicsPipeline, GraphicsPipelineAbstract};
 use vulkano::render_pass::{Framebuffer, FramebufferAbstract, RenderPass, Subpass};
 use vulkano::single_pass_renderpass;
 use vulkano::swapchain::{
@@ -32,14 +39,10 @@ use vulkano::swapchain::{
     FullscreenExclusive, PresentMode, SupportedPresentModes, Surface, Swapchain,
 };
 use vulkano::sync::{self, GpuFuture, SharingMode};
-use vulkano::buffer::{
-    cpu_access::CpuAccessibleBuffer,
-    BufferUsage,
-    BufferAccess,
-};
-use vulkano::impl_vertex;
 
 use vulkano_win::VkSurfaceBuild;
+
+use cgmath::{Deg, Matrix4, Point3, Rad, Vector3};
 
 const WIDTH: u32 = 800;
 const HEIGHT: u32 = 600;
@@ -88,14 +91,28 @@ impl Vertex {
         Self { position, color }
     }
 }
+
+#[allow(clippy::ref_in_deref)]
 impl_vertex!(Vertex, position, color);
+
+#[allow(dead_code)]
+#[derive(Copy, Clone)]
+struct UniformBufferObject {
+    model: Matrix4<f32>,
+    view: Matrix4<f32>,
+    proj: Matrix4<f32>,
+}
 
 fn vertices() -> [Vertex; 3] {
     [
-        Vertex::new([ 0.0, -0.5], [1.0, 0.0, 0.0]),
-        Vertex::new([ 0.5,  0.5], [0.0, 1.0, 0.0]),
-        Vertex::new([-0.5,  0.5], [0.0, 0.0, 1.0]),
+        Vertex::new([0.0, -0.5], [1.0, 0.0, 0.0]),
+        Vertex::new([0.5, 0.5], [0.0, 1.0, 0.0]),
+        Vertex::new([-0.5, 0.5], [0.0, 0.0, 1.0]),
     ]
+}
+
+fn indices() -> [u16; 6] {
+    [0, 1, 2, 2, 3, 0]
 }
 
 pub struct HelloWorldApplication {
@@ -122,10 +139,15 @@ pub struct HelloWorldApplication {
     swap_chain_framebuffers: Vec<Arc<dyn FramebufferAbstract + Send + Sync>>,
 
     vertex_buffer: Arc<dyn BufferAccess + Send + Sync>,
-    //command_buffers: Vec<Arc<PrimaryAutoCommandBuffer>>,
+    index_buffer: Arc<dyn TypedBufferAccess<Content = [u16]> + Send + Sync>,
+
+    uniform_buffers: Vec<Arc<CpuAccessibleBuffer<UniformBufferObject>>>,
 
     previous_frame_end: Option<Box<dyn GpuFuture>>,
     recreate_swap_chain: bool,
+
+    #[allow(dead_code)]
+    start_time: Instant,
 }
 
 impl HelloWorldApplication {
@@ -154,11 +176,20 @@ impl HelloWorldApplication {
 
         let swap_chain_framebuffers = Self::create_framebuffers(&swap_chain_images, &render_pass);
 
-        let vertex_buffer = Self::create_vertex_buffer(&device);
+        let start_time = Instant::now();
+
+        let vertex_buffer = Self::create_vertex_buffer(&graphics_queue);
+        let index_buffer = Self::create_index_buffer(&graphics_queue);
+        let uniform_buffers = Self::create_uniform_buffers(
+            &device,
+            swap_chain_images.len(),
+            start_time,
+            swap_chain.dimensions(),
+        );
 
         let previous_frame_end = Some(Self::create_sync_objects(&device));
 
-        let mut app = Self {
+        Self {
             event_loop: Some(event_loop),
             surface,
             instance,
@@ -179,14 +210,14 @@ impl HelloWorldApplication {
             swap_chain_framebuffers,
 
             vertex_buffer,
-            //command_buffers: vec![],
+            index_buffer,
+            uniform_buffers,
 
             previous_frame_end,
             recreate_swap_chain: false,
-        };
 
-        //app.create_command_buffers();
-        app
+            start_time,
+        }
     }
 
     fn create_instance() -> Arc<Instance> {
@@ -449,8 +480,7 @@ impl HelloWorldApplication {
         device: &Arc<Device>,
         swap_chain_extent: [u32; 2],
         render_pass: &Arc<RenderPass>,
-    ) -> Arc<dyn GraphicsPipelineAbstract + Send + Sync>
-    {
+    ) -> Arc<dyn GraphicsPipelineAbstract + Send + Sync> {
         mod vertex_shader {
             vulkano_shaders::shader! {
                 ty: "vertex",
@@ -498,9 +528,55 @@ impl HelloWorldApplication {
         )
     }
 
-    fn create_vertex_buffer(device: &Arc<Device>) -> Arc<dyn BufferAccess + Send + Sync> {
-        CpuAccessibleBuffer::from_iter(device.clone(),
-            BufferUsage::vertex_buffer(), false, vertices().iter().cloned()).unwrap()
+    fn create_vertex_buffer(graphics_queue: &Arc<Queue>) -> Arc<dyn BufferAccess + Send + Sync> {
+        let (buffer, future) = ImmutableBuffer::from_iter(
+            vertices().iter().cloned(),
+            BufferUsage::vertex_buffer(),
+            graphics_queue.clone(),
+        )
+        .unwrap();
+
+        future.flush().unwrap();
+
+        buffer
+    }
+
+    fn create_index_buffer(
+        graphics_queue: &Arc<Queue>,
+    ) -> Arc<dyn TypedBufferAccess<Content = [u16]> + Send + Sync> {
+        let (buffer, future) = ImmutableBuffer::from_iter(
+            indices().iter().cloned(),
+            BufferUsage::index_buffer(),
+            graphics_queue.clone(),
+        )
+        .unwrap();
+        future.flush().unwrap();
+        buffer
+    }
+
+    fn create_uniform_buffers(
+        device: &Arc<Device>,
+        num_buffers: usize,
+        start_time: Instant,
+        dimensions_u32: [u32; 2],
+    ) -> Vec<Arc<CpuAccessibleBuffer<UniformBufferObject>>> {
+        let mut buffers = Vec::new();
+
+        let dimensions = [dimensions_u32[0] as f32, dimensions_u32[1] as f32];
+        let uniform_buffer = Self::update_uniform_buffer(start_time, dimensions);
+        for _ in 0..num_buffers {
+            let buffer = CpuAccessibleBuffer::from_data(
+                device.clone(),
+                BufferUsage::uniform_buffer_transfer_destination(),
+                false,
+                uniform_buffer,
+            )
+            .unwrap();
+
+            buffers.push(buffer);
+        }
+
+        buffers
     }
 
     fn create_framebuffers(
@@ -628,9 +704,36 @@ impl HelloWorldApplication {
         let mut builder = AutoCommandBufferBuilder::primary(
             self.device.clone(),
             self.graphics_queue.family(),
-            CommandBufferUsage::MultipleSubmit,
+            CommandBufferUsage::OneTimeSubmit,
         )
         .unwrap();
+
+        let description = DescriptorDesc {
+            ty: DescriptorDescTy::Buffer(DescriptorBufferDesc {
+                dynamic: Some(false),
+                storage: false,
+            }),
+            array_count: 1,
+            stages: ShaderStages {
+                vertex: true,
+                ..ShaderStages::none()
+            },
+            readonly: true,
+        };
+
+        self.uniform_buffers = Self::create_uniform_buffers(&self.device, self.swap_chain_images.len(),
+            self.start_time, self.swap_chain.dimensions());
+
+        let sets = self.uniform_buffers.iter().enumerate()
+            .map(|(idx, buffer)| {
+                let layout = self.graphics_pipeline.descriptor_set_layout(idx).unwrap();
+
+                Arc::new(PersistentDescriptorSet::start(layout.clone())
+                    .add_buffer(buffer.clone())
+                    .unwrap()
+                    .build()
+                    .unwrap())
+            }).collect::<Vec<_>>();
 
         builder
             .begin_render_pass(
@@ -639,11 +742,12 @@ impl HelloWorldApplication {
                 vec![[0.0, 0.0, 0.0, 1.0].into()],
             )
             .unwrap()
-            .draw(
+            .draw_indexed(
                 self.graphics_pipeline.clone(),
                 &DynamicState::none(),
                 vec![self.vertex_buffer.clone()],
-                (),
+                self.index_buffer.clone(),
+                sets,
                 (),
                 vec![],
             )
@@ -673,15 +777,35 @@ impl HelloWorldApplication {
             }
             Err(vulkano::sync::FlushError::OutOfDate) => {
                 self.recreate_swap_chain = true;
-                self.previous_frame_end =
-                    Some(vulkano::sync::now(self.device.clone()).boxed());
+                self.previous_frame_end = Some(vulkano::sync::now(self.device.clone()).boxed());
             }
             Err(e) => {
                 println!("{:?}", e);
-                self.previous_frame_end =
-                    Some(vulkano::sync::now(self.device.clone()).boxed());
+                self.previous_frame_end = Some(vulkano::sync::now(self.device.clone()).boxed());
             }
         }
+    }
+
+    fn update_uniform_buffer(start_time: Instant, dimensions: [f32; 2]) -> UniformBufferObject {
+        let duration = Instant::now().duration_since(start_time);
+        let elapsed = (duration.as_secs() * 1000) + u64::from(duration.subsec_millis());
+
+        let model = Matrix4::from_angle_z(Rad::from(Deg(elapsed as f32 * 0.180)));
+        let view = Matrix4::look_at_rh(
+            Point3::new(2.0, 2.0, 2.0),
+            Point3::new(0.0, 0.0, 0.0),
+            Vector3::new(0.0, 0.0, 1.0),
+        );
+        let mut proj = cgmath::perspective(
+            Rad::from(Deg(45.0)),
+            dimensions[0] / dimensions[1],
+            0.1,
+            10.0,
+        );
+
+        proj.y.y *= -1.0;
+
+        UniformBufferObject { model, view, proj }
     }
 
     fn recreate_swap_chain(&mut self) {
@@ -702,7 +826,8 @@ impl HelloWorldApplication {
             self.swap_chain.dimensions(),
             &self.render_pass,
         );
-        self.swap_chain_framebuffers = Self::create_framebuffers(&self.swap_chain_images, &self.render_pass);
+        self.swap_chain_framebuffers =
+            Self::create_framebuffers(&self.swap_chain_images, &self.render_pass);
         //self.create_command_buffers();
     }
 
