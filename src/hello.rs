@@ -13,7 +13,7 @@ use winit::event_loop::{ControlFlow, EventLoop};
 use winit::window::{Window, WindowBuilder};
 
 use vulkano::buffer::{
-    BufferAccess, BufferUsage, CpuAccessibleBuffer, ImmutableBuffer, TypedBufferAccess,
+    BufferAccess, BufferUsage, CpuAccessibleBuffer, ImmutableBuffer, TypedBufferAccess, CpuBufferPool,
 };
 use vulkano::command_buffer::{
     AutoCommandBufferBuilder, CommandBufferUsage, DynamicState, PrimaryAutoCommandBuffer,
@@ -22,7 +22,7 @@ use vulkano::command_buffer::{
 use vulkano::descriptor::descriptor::{
     DescriptorBufferDesc, DescriptorDesc, DescriptorDescTy, ShaderStages,
 };
-use vulkano::descriptor::descriptor_set::{PersistentDescriptorSet, UnsafeDescriptorSetLayout};
+use vulkano::descriptor::descriptor_set::PersistentDescriptorSet;
 use vulkano::device::{Device, DeviceExtensions, Features, Queue};
 use vulkano::format::Format;
 use vulkano::image::{swapchain::SwapchainImage, view::ImageView, ImageUsage};
@@ -103,11 +103,12 @@ struct UniformBufferObject {
     proj: Matrix4<f32>,
 }
 
-fn vertices() -> [Vertex; 3] {
+fn vertices() -> [Vertex; 4] {
     [
-        Vertex::new([0.0, -0.5], [1.0, 0.0, 0.0]),
-        Vertex::new([0.5, 0.5], [0.0, 1.0, 0.0]),
-        Vertex::new([-0.5, 0.5], [0.0, 0.0, 1.0]),
+        Vertex::new([-0.5, -0.5], [1.0, 0.0, 0.0]),
+        Vertex::new([0.5, -0.5], [0.0, 1.0, 0.0]),
+        Vertex::new([0.5, 0.5], [0.0, 0.0, 1.0]),
+        Vertex::new([-0.5, 0.5], [1.0, 1.0, 1.0])
     ]
 }
 
@@ -247,49 +248,6 @@ impl HelloWorldApplication {
         Instance::new(Some(&app_info), &required_extensions, None)
             .expect("Failed to create Vulkan instance")
     }
-
-    //fn create_command_buffers(&mut self) {
-    //    let queue_family = self.graphics_queue.family();
-    //    self.command_buffers = self
-    //        .swap_chain_framebuffers
-    //        .iter()
-    //        .map(|framebuffer| {
-    //            let vertices = BufferlessVertices {
-    //                vertices: 3,
-    //                instances: 1,
-    //            };
-    //            let mut builder = AutoCommandBufferBuilder::primary(
-    //                self.device.clone(),
-    //                queue_family,
-    //                CommandBufferUsage::MultipleSubmit,
-    //            )
-    //            .unwrap();
-
-    //            builder
-    //                .begin_render_pass(
-    //                    framebuffer.clone(),
-    //                    SubpassContents::Inline,
-    //                    vec![[0.0, 0.0, 0.0, 1.0].into()],
-    //                )
-    //                .unwrap()
-    //                .draw(
-    //                    self.graphics_pipeline.clone(),
-    //                    &DynamicState::none(),
-    //                    vertices,
-    //                    (),
-    //                    (),
-    //                    vec![],
-    //                )
-    //                .unwrap()
-    //                .end_render_pass()
-    //                .unwrap();
-
-    //            let command_buffer = builder.build().unwrap();
-
-    //            Arc::new(command_buffer)
-    //        })
-    //        .collect();
-    //}
 
     fn setup_debug_callback(instance: &Arc<Instance>) -> Option<DebugCallback> {
         if !ENABLE_VALIDATION_LAYERS {
@@ -724,16 +682,12 @@ impl HelloWorldApplication {
         self.uniform_buffers = Self::create_uniform_buffers(&self.device, self.swap_chain_images.len(),
             self.start_time, self.swap_chain.dimensions());
 
-        let sets = self.uniform_buffers.iter().enumerate()
-            .map(|(idx, buffer)| {
-                let layout = self.graphics_pipeline.descriptor_set_layout(idx).unwrap();
-
-                Arc::new(PersistentDescriptorSet::start(layout.clone())
-                    .add_buffer(buffer.clone())
-                    .unwrap()
-                    .build()
-                    .unwrap())
-            }).collect::<Vec<_>>();
+        let layout = self.graphics_pipeline.descriptor_set_layout(0).unwrap();
+        let set = Arc::new(PersistentDescriptorSet::start(layout.clone())
+            .add_buffer(self.uniform_buffers[0].clone())
+            .unwrap()
+            .build()
+            .unwrap());
 
         builder
             .begin_render_pass(
@@ -747,7 +701,7 @@ impl HelloWorldApplication {
                 &DynamicState::none(),
                 vec![self.vertex_buffer.clone()],
                 self.index_buffer.clone(),
-                sets,
+                set,
                 (),
                 vec![],
             )
@@ -828,7 +782,6 @@ impl HelloWorldApplication {
         );
         self.swap_chain_framebuffers =
             Self::create_framebuffers(&self.swap_chain_images, &self.render_pass);
-        //self.create_command_buffers();
     }
 
     pub fn main_loop(mut self) {
