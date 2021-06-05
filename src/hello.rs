@@ -8,12 +8,13 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use winit::dpi::LogicalSize;
-use winit::event::{Event, WindowEvent};
+use winit::event::{ElementState, Event, KeyboardInput, MouseButton, VirtualKeyCode, WindowEvent};
 use winit::event_loop::{ControlFlow, EventLoop};
 use winit::window::{Window, WindowBuilder};
 
 use vulkano::buffer::{
-    BufferAccess, BufferUsage, CpuAccessibleBuffer, ImmutableBuffer, TypedBufferAccess, CpuBufferPool,
+    BufferAccess, BufferUsage, CpuAccessibleBuffer, CpuBufferPool, ImmutableBuffer,
+    TypedBufferAccess,
 };
 use vulkano::command_buffer::{
     AutoCommandBufferBuilder, CommandBufferUsage, DynamicState, PrimaryAutoCommandBuffer,
@@ -42,7 +43,7 @@ use vulkano::sync::{self, GpuFuture, SharingMode};
 
 use vulkano_win::VkSurfaceBuild;
 
-use cgmath::{Deg, Matrix4, Point3, Rad, Vector3};
+use cgmath::{Deg, Matrix4, Point3, Rad, Vector2, Vector3};
 
 const WIDTH: u32 = 800;
 const HEIGHT: u32 = 600;
@@ -108,12 +109,41 @@ fn vertices() -> [Vertex; 4] {
         Vertex::new([-0.5, -0.5], [1.0, 0.0, 0.0]),
         Vertex::new([0.5, -0.5], [0.0, 1.0, 0.0]),
         Vertex::new([0.5, 0.5], [0.0, 0.0, 1.0]),
-        Vertex::new([-0.5, 0.5], [1.0, 1.0, 1.0])
+        Vertex::new([-0.5, 0.5], [1.0, 1.0, 1.0]),
     ]
 }
 
 fn indices() -> [u16; 6] {
     [0, 1, 2, 2, 3, 0]
+}
+
+struct MouseState {
+    delta: [f64; 2],
+    position: [f64; 2],
+
+    right_click: bool,
+}
+
+impl MouseState {
+    pub fn new() -> Self {
+        Self {
+            delta: [0.0, 0.0],
+            position: [0.0, 0.0],
+            right_click: false,
+        }
+    }
+}
+
+struct InputState {
+    mouse: MouseState,
+}
+
+impl InputState {
+    pub fn new() -> Self {
+        Self {
+            mouse: MouseState::new(),
+        }
+    }
 }
 
 pub struct HelloWorldApplication {
@@ -149,6 +179,8 @@ pub struct HelloWorldApplication {
 
     #[allow(dead_code)]
     start_time: Instant,
+
+    input: InputState,
 }
 
 impl HelloWorldApplication {
@@ -218,6 +250,8 @@ impl HelloWorldApplication {
             recreate_swap_chain: false,
 
             start_time,
+
+            input: InputState::new(),
         }
     }
 
@@ -477,7 +511,7 @@ impl HelloWorldApplication {
                 .depth_clamp(false)
                 .polygon_mode_fill()
                 .line_width(1.0)
-                .cull_mode_back()
+                .cull_mode_disabled()
                 .front_face_clockwise()
                 .blend_pass_through()
                 .render_pass(Subpass::from(render_pass.clone(), 0).unwrap())
@@ -679,15 +713,21 @@ impl HelloWorldApplication {
             readonly: true,
         };
 
-        self.uniform_buffers = Self::create_uniform_buffers(&self.device, self.swap_chain_images.len(),
-            self.start_time, self.swap_chain.dimensions());
+        self.uniform_buffers = Self::create_uniform_buffers(
+            &self.device,
+            self.swap_chain_images.len(),
+            self.start_time,
+            self.swap_chain.dimensions(),
+        );
 
         let layout = self.graphics_pipeline.descriptor_set_layout(0).unwrap();
-        let set = Arc::new(PersistentDescriptorSet::start(layout.clone())
-            .add_buffer(self.uniform_buffers[0].clone())
-            .unwrap()
-            .build()
-            .unwrap());
+        let set = Arc::new(
+            PersistentDescriptorSet::start(layout.clone())
+                .add_buffer(self.uniform_buffers[0].clone())
+                .unwrap()
+                .build()
+                .unwrap(),
+        );
 
         builder
             .begin_render_pass(
@@ -746,7 +786,7 @@ impl HelloWorldApplication {
 
         let model = Matrix4::from_angle_z(Rad::from(Deg(elapsed as f32 * 0.180)));
         let view = Matrix4::look_at_rh(
-            Point3::new(2.0, 2.0, 2.0),
+            Point3::new(1.0, 1.0, 1.0),
             Point3::new(0.0, 0.0, 0.0),
             Vector3::new(0.0, 0.0, 1.0),
         );
@@ -784,6 +824,23 @@ impl HelloWorldApplication {
             Self::create_framebuffers(&self.swap_chain_images, &self.render_pass);
     }
 
+    fn update_cursor(&mut self, position: [f64; 2]) {
+        let prev_position = self.input.mouse.position;
+        self.input.mouse.position = position;
+
+        let prev_vec: Vector2<_> = prev_position.into();
+        let curr_vec: Vector2<_> = self.input.mouse.position.into();
+        let dir = prev_vec - curr_vec;
+
+        self.input.mouse.delta = dir.into();
+    }
+
+    fn update(&mut self) {
+        if self.input.mouse.right_click {
+            println!("Right Click is being pressed");
+        }
+    }
+
     pub fn main_loop(mut self) {
         let event_loop = &mut self.event_loop;
         let surface_window_id = self.surface.window().id();
@@ -791,19 +848,38 @@ impl HelloWorldApplication {
         self.event_loop
             .take()
             .unwrap()
-            .run(move |event, _, control_flow| {
-                *control_flow = ControlFlow::Wait;
+            .run(move |event, _, control_flow| match event {
 
-                match event {
-                    Event::WindowEvent {
-                        event: WindowEvent::CloseRequested,
-                        window_id,
-                    } if window_id == surface_window_id => *control_flow = ControlFlow::Exit,
-                    Event::RedrawEventsCleared => {
-                        self.draw_frame();
+                Event::WindowEvent {
+                    event, window_id, ..
+                } => match event {
+                    WindowEvent::CloseRequested { .. } if window_id == surface_window_id => {
+                        *control_flow = ControlFlow::Exit
                     }
+                    WindowEvent::KeyboardInput {
+                        input:
+                            KeyboardInput {
+                                virtual_keycode: Some(VirtualKeyCode::Escape),
+                                ..
+                            },
+                        ..
+                    } => *control_flow = ControlFlow::Exit,
+                    WindowEvent::CursorMoved { position, .. } => {
+                        self.update_cursor(position.into())
+                    }
+                    WindowEvent::MouseInput {
+                        state,
+                        button: MouseButton::Right,
+                        ..
+                    } => self.input.mouse.right_click = state == ElementState::Pressed
                     _ => (),
+                },
+
+                Event::MainEventsCleared => {
+                    self.update();
+                    self.draw_frame();
                 }
+                _ => (),
             });
     }
 }

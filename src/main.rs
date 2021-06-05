@@ -1,4 +1,7 @@
+#![allow(unused_imports)]
+
 mod hello;
+mod chunk;
 
 use log::{debug, error, info, log_enabled, Level};
 
@@ -7,6 +10,6 @@ fn main() {
 
     info!("Staring Vulkan Renderer...");
 
-    let mut app = hello::HelloWorldApplication::new();
+    let app = hello::HelloWorldApplication::new();
     app.main_loop();
 }
