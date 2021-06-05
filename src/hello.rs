@@ -23,7 +23,7 @@ use vulkano::command_buffer::{
 use vulkano::descriptor::descriptor::{
     DescriptorBufferDesc, DescriptorDesc, DescriptorDescTy, ShaderStages,
 };
-use vulkano::descriptor::descriptor_set::PersistentDescriptorSet;
+use vulkano::descriptor::descriptor_set::{PersistentDescriptorSet, FixedSizeDescriptorSetsPool};
 use vulkano::device::{Device, DeviceExtensions, Features, Queue};
 use vulkano::format::Format;
 use vulkano::image::{swapchain::SwapchainImage, view::ImageView, ImageUsage};
@@ -174,6 +174,8 @@ pub struct HelloWorldApplication {
 
     uniform_buffers: Vec<Arc<CpuAccessibleBuffer<UniformBufferObject>>>,
 
+    descriptor_sets_pool: FixedSizeDescriptorSetsPool,
+
     previous_frame_end: Option<Box<dyn GpuFuture>>,
     recreate_swap_chain: bool,
 
@@ -220,6 +222,8 @@ impl HelloWorldApplication {
             swap_chain.dimensions(),
         );
 
+        let descriptor_sets_pool = FixedSizeDescriptorSetsPool::new(graphics_pipeline.descriptor_set_layout(0).unwrap().clone());
+
         let previous_frame_end = Some(Self::create_sync_objects(&device));
 
         Self {
@@ -245,6 +249,8 @@ impl HelloWorldApplication {
             vertex_buffer,
             index_buffer,
             uniform_buffers,
+
+            descriptor_sets_pool,
 
             previous_frame_end,
             recreate_swap_chain: false,
@@ -700,19 +706,6 @@ impl HelloWorldApplication {
         )
         .unwrap();
 
-        let description = DescriptorDesc {
-            ty: DescriptorDescTy::Buffer(DescriptorBufferDesc {
-                dynamic: Some(false),
-                storage: false,
-            }),
-            array_count: 1,
-            stages: ShaderStages {
-                vertex: true,
-                ..ShaderStages::none()
-            },
-            readonly: true,
-        };
-
         self.uniform_buffers = Self::create_uniform_buffers(
             &self.device,
             self.swap_chain_images.len(),
@@ -722,7 +715,7 @@ impl HelloWorldApplication {
 
         let layout = self.graphics_pipeline.descriptor_set_layout(0).unwrap();
         let set = Arc::new(
-            PersistentDescriptorSet::start(layout.clone())
+            self.descriptor_sets_pool.next()
                 .add_buffer(self.uniform_buffers[0].clone())
                 .unwrap()
                 .build()
@@ -871,7 +864,7 @@ impl HelloWorldApplication {
                         state,
                         button: MouseButton::Right,
                         ..
-                    } => self.input.mouse.right_click = state == ElementState::Pressed
+                    } => self.input.mouse.right_click = state == ElementState::Pressed,
                     _ => (),
                 },
 
