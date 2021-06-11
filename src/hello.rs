@@ -17,16 +17,19 @@ use vulkano::buffer::{
     TypedBufferAccess,
 };
 use vulkano::command_buffer::{
-    AutoCommandBufferBuilder, CommandBufferUsage, DynamicState, PrimaryAutoCommandBuffer,
-    SubpassContents,
+    AutoCommandBufferBuilder, CommandBufferExecFuture, CommandBufferUsage, DynamicState,
+    PrimaryAutoCommandBuffer, SubpassContents,
 };
 use vulkano::descriptor::descriptor::{
     DescriptorBufferDesc, DescriptorDesc, DescriptorDescTy, ShaderStages,
 };
-use vulkano::descriptor::descriptor_set::{PersistentDescriptorSet, FixedSizeDescriptorSetsPool};
+use vulkano::descriptor::descriptor_set::{FixedSizeDescriptorSetsPool, PersistentDescriptorSet};
 use vulkano::device::{Device, DeviceExtensions, Features, Queue};
 use vulkano::format::Format;
-use vulkano::image::{swapchain::SwapchainImage, view::ImageView, ImageUsage};
+use vulkano::image::{
+    swapchain::SwapchainImage, view::ImageView, ImageDimensions, ImageUsage, ImmutableImage,
+    MipmapsCount,
+};
 use vulkano::impl_vertex;
 use vulkano::instance::debug::{DebugCallback, MessageSeverity, MessageType};
 use vulkano::instance::{
@@ -39,11 +42,15 @@ use vulkano::swapchain::{
     acquire_next_image, AcquireError, Capabilities, ColorSpace, CompositeAlpha,
     FullscreenExclusive, PresentMode, SupportedPresentModes, Surface, Swapchain,
 };
-use vulkano::sync::{self, GpuFuture, SharingMode};
+use vulkano::sync::{self, GpuFuture, NowFuture, SharingMode};
+use vulkano::sampler::{Sampler, Filter, MipmapMode, SamplerAddressMode};
 
 use vulkano_win::VkSurfaceBuild;
 
 use cgmath::{Deg, Matrix4, Point3, Rad, Vector2, Vector3};
+
+use image::io::Reader as ImageReader;
+use image::DynamicImage::*;
 
 const WIDTH: u32 = 800;
 const HEIGHT: u32 = 600;
@@ -84,17 +91,17 @@ impl QueueFamilyIndices {
 #[derive(Default, Copy, Clone)]
 struct Vertex {
     position: [f32; 2],
-    color: [f32; 3],
+    uv: [f32; 2],
 }
 
 impl Vertex {
-    fn new(position: [f32; 2], color: [f32; 3]) -> Self {
-        Self { position, color }
+    fn new(position: [f32; 2], uv: [f32; 2]) -> Self {
+        Self { position, uv }
     }
 }
 
 #[allow(clippy::ref_in_deref)]
-impl_vertex!(Vertex, position, color);
+impl_vertex!(Vertex, position, uv);
 
 #[allow(dead_code)]
 #[derive(Copy, Clone)]
@@ -106,10 +113,10 @@ struct UniformBufferObject {
 
 fn vertices() -> [Vertex; 4] {
     [
-        Vertex::new([-0.5, -0.5], [1.0, 0.0, 0.0]),
-        Vertex::new([0.5, -0.5], [0.0, 1.0, 0.0]),
-        Vertex::new([0.5, 0.5], [0.0, 0.0, 1.0]),
-        Vertex::new([-0.5, 0.5], [1.0, 1.0, 1.0]),
+        Vertex::new([-0.5, -0.5], [0.0, 0.0]),
+        Vertex::new([0.5, -0.5], [1.0, 0.0]),
+        Vertex::new([0.5, 0.5], [1.0, 1.0]),
+        Vertex::new([-0.5, 0.5], [0.0, 1.0]),
     ]
 }
 
@@ -183,6 +190,9 @@ pub struct HelloWorldApplication {
     start_time: Instant,
 
     input: InputState,
+
+    image_view: Arc<ImageView<Arc<ImmutableImage>>>,
+    image_sampler: Arc<Sampler>,
 }
 
 impl HelloWorldApplication {
@@ -222,9 +232,25 @@ impl HelloWorldApplication {
             swap_chain.dimensions(),
         );
 
-        let descriptor_sets_pool = FixedSizeDescriptorSetsPool::new(graphics_pipeline.descriptor_set_layout(0).unwrap().clone());
+        let descriptor_sets_pool = FixedSizeDescriptorSetsPool::new(
+            graphics_pipeline.descriptor_set_layout(0).unwrap().clone(),
+        );
 
         let previous_frame_end = Some(Self::create_sync_objects(&device));
+
+        let (image_view, image_future) = Self::load_image(&graphics_queue);
+
+        let image_sampler = Sampler::new(device.clone(),
+            Filter::Linear,
+            Filter::Linear, MipmapMode::Linear,
+            SamplerAddressMode::Repeat,
+            SamplerAddressMode::Repeat,
+            SamplerAddressMode::Repeat,
+            0.0,
+            1.0,
+            0.0,
+            0.0
+        ).unwrap();
 
         Self {
             event_loop: Some(event_loop),
@@ -258,7 +284,45 @@ impl HelloWorldApplication {
             start_time,
 
             input: InputState::new(),
+
+            image_view,
+            image_sampler,
         }
+    }
+
+    fn load_image(
+        graphics_queue: &Arc<Queue>,
+    ) -> (
+        Arc<ImageView<Arc<ImmutableImage>>>,
+        CommandBufferExecFuture<NowFuture, PrimaryAutoCommandBuffer>,
+    ) {
+        let img = ImageReader::open("src/img/grass.jpg")
+            .unwrap()
+            .decode()
+            .unwrap();
+
+        let rgb = match img {
+            ImageRgb8(rgb_image) => rgb_image,
+            _ => panic!("Not Rgb8"),
+        };
+        let image_data = rgb.as_raw();
+        let dimensions = rgb.dimensions();
+        let image_dimensions = ImageDimensions::Dim2d {
+            width: dimensions.0,
+            height: dimensions.1,
+            array_layers: 1,
+        };
+
+        let (image, future) = ImmutableImage::from_iter(
+            image_data.iter().cloned(),
+            image_dimensions,
+            MipmapsCount::One,
+            Format::R8G8B8Srgb,
+            graphics_queue.clone(),
+        )
+        .unwrap();
+
+        (ImageView::new(image).unwrap(), future)
     }
 
     fn create_instance() -> Arc<Instance> {
@@ -715,8 +779,11 @@ impl HelloWorldApplication {
 
         let layout = self.graphics_pipeline.descriptor_set_layout(0).unwrap();
         let set = Arc::new(
-            self.descriptor_sets_pool.next()
+            self.descriptor_sets_pool
+                .next()
                 .add_buffer(self.uniform_buffers[0].clone())
+                .unwrap()
+                .add_sampled_image(self.image_view.clone(), self.image_sampler.clone())
                 .unwrap()
                 .build()
                 .unwrap(),
@@ -842,7 +909,6 @@ impl HelloWorldApplication {
             .take()
             .unwrap()
             .run(move |event, _, control_flow| match event {
-
                 Event::WindowEvent {
                     event, window_id, ..
                 } => match event {

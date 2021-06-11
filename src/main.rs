@@ -1,7 +1,6 @@
 #![allow(unused_imports)]
 
 mod hello;
-mod chunk;
 
 use log::{debug, error, info, log_enabled, Level};
 
